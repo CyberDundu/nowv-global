@@ -1,0 +1,8 @@
+.env
+AI-project/.env
+AI-project/chat_rooms/
+AI-project/translation_history.csv
+index_light_backup.html
+v_raw.*
+__pycache__/
+.DS_Store
