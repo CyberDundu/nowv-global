@@ -1,4 +1,7 @@
 import os
+import secrets
+from pathlib import Path
+from urllib.parse import urlencode
 import io
 import wave
 import json
@@ -12,7 +15,23 @@ from google import genai
 from google.genai import types
 
 load_dotenv()
-client = genai.Client()
+# Read API key from local environment or Streamlit Cloud Secrets.
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = None
+
+if not api_key:
+    st.error(
+        "Gemini API key is missing. "
+        "Configure GEMINI_API_KEY in your environment or Streamlit Secrets."
+    )
+    st.stop()
+
+client = genai.Client(api_key=api_key)
 
 LANGUAGES = {
     "Hausa": "ha",
@@ -29,7 +48,7 @@ LANGUAGES = {
     "Spanish": "es",
 }
 
-FAST_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+FAST_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash"]
 
 def compress_wav_bytes(wav_bytes):
     """Shrinks WAV audio to lightweight 16kHz mono for fast upload."""
@@ -187,8 +206,149 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+
+
+# ==========================================
+# NOWV SHARED CHAT ROOMS — PROTOTYPE STORAGE
+# ==========================================
+
+ROOMS_DIR = Path(__file__).resolve().parent / "chat_rooms"
+ROOMS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clean_room_id(value):
+    value = str(value or "").upper().strip()
+    return "".join(
+        char for char in value
+        if char.isalnum() or char == "-"
+    )[:40]
+
+
+def create_room_id():
+    return "NOWV-" + secrets.token_hex(3).upper()
+
+
+def room_file(room_id):
+    return ROOMS_DIR / f"{clean_room_id(room_id)}.json"
+
+
+def load_room_messages(room_id):
+    file_path = room_file(room_id)
+
+    if not file_path.exists():
+        return []
+
+    try:
+        with file_path.open("r", encoding="utf-8") as file:
+            messages = json.load(file)
+
+        for message in messages:
+            for media_key in ("audio_bytes", "video_bytes"):
+                encoded = message.get(media_key)
+                if encoded:
+                    message[media_key] = base64.b64decode(encoded)
+
+        return messages
+
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_room_messages(room_id, messages):
+    file_path = room_file(room_id)
+    serializable = []
+
+    for message in messages:
+        item = dict(message)
+
+        for media_key in ("audio_bytes", "video_bytes"):
+            media = item.get(media_key)
+            if isinstance(media, bytes):
+                item[media_key] = base64.b64encode(media).decode("ascii")
+
+        serializable.append(item)
+
+    temporary_file = file_path.with_suffix(".tmp")
+
+    with temporary_file.open("w", encoding="utf-8") as file:
+        json.dump(serializable, file, ensure_ascii=False)
+
+    temporary_file.replace(file_path)
+
+
+def add_message(message):
+    st.session_state.wa_messages.append(message)
+    save_room_messages(
+        st.session_state.room_id,
+        st.session_state.wa_messages,
+    )
+
+
+requested_room = clean_room_id(st.query_params.get("room", ""))
+
+if "room_id" not in st.session_state:
+    st.session_state.room_id = requested_room or create_room_id()
+elif requested_room and requested_room != st.session_state.room_id:
+    st.session_state.room_id = requested_room
+    st.session_state.wa_messages = load_room_messages(requested_room)
+
 if "wa_messages" not in st.session_state:
-    st.session_state.wa_messages = []
+    st.session_state.wa_messages = load_room_messages(
+        st.session_state.room_id
+    )
+
+
+
+
+# ==========================================
+# ROOM CONTROLS AND INVITATION LINK
+# ==========================================
+
+with st.expander("🔗 Conversation Room & Invitation", expanded=True):
+    st.markdown(f"**Your room code:** `{st.session_state.room_id}`")
+
+    public_app_url = st.text_input(
+        "Public NowV chat app URL",
+        value=os.getenv("NOWV_APP_URL", ""),
+        placeholder="https://your-app-name.streamlit.app",
+        help="Enter your deployed Streamlit app address.",
+    ).strip()
+
+    if public_app_url:
+        invite_url = (
+            public_app_url.rstrip("/")
+            + "/?"
+            + urlencode({"room": st.session_state.room_id})
+        )
+        st.text_input("Share this invitation link", value=invite_url)
+        st.caption("Send this link to the person you want to chat with.")
+    else:
+        st.caption(
+            "Enter your deployed app URL above to create a shareable link."
+        )
+
+    join_col, create_col = st.columns(2)
+
+    with join_col:
+        join_code = st.text_input(
+            "Enter another room code",
+            placeholder="NOWV-XXXXXX",
+            key="nowv_join_code",
+        )
+        if st.button("Join Room", use_container_width=True):
+            new_room = clean_room_id(join_code)
+            if new_room:
+                st.query_params["room"] = new_room
+                st.rerun()
+            else:
+                st.warning("Enter a valid room code.")
+
+    with create_col:
+        if st.button("Create New Room", use_container_width=True):
+            new_room = create_room_id()
+            st.query_params["room"] = new_room
+            st.rerun()
+
 
 lang_names = list(LANGUAGES.keys())
 
@@ -211,6 +371,7 @@ with ctrl1:
 with ctrl2:
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.wa_messages = []
+        save_room_messages(st.session_state.room_id, [])
         st.rerun()
 
 # --- WHATSAPP CHAT FEED ---
@@ -259,7 +420,7 @@ with mode_tab_text:
                 try:
                     translated = translate_chat_text(msg_text.strip(), from_lang, to_lang)
                     tts_audio = generate_speech_bytes(translated, LANGUAGES[to_lang])
-                    st.session_state.wa_messages.append({
+                    add_message({
                         "sender": sender_name,
                         "time": datetime.now().strftime("%H:%M"),
                         "kind": "Text",
@@ -283,7 +444,7 @@ with mode_tab_audio:
                 try:
                     spoken, translated = translate_media_or_audio(raw_wav, "audio/wav", from_lang, to_lang)
                     tts_audio = generate_speech_bytes(translated, LANGUAGES[to_lang])
-                    st.session_state.wa_messages.append({
+                    add_message({
                         "sender": sender_name,
                         "time": datetime.now().strftime("%H:%M"),
                         "kind": "🎙️ Voice Note",
@@ -308,7 +469,7 @@ with mode_tab_video:
                     vid_mime = video_file.type or "video/mp4"
                     spoken_vid, translated_vid = translate_media_or_audio(vid_bytes, vid_mime, from_lang, to_lang)
                     tts_audio = generate_speech_bytes(translated_vid, LANGUAGES[to_lang])
-                    st.session_state.wa_messages.append({
+                    add_message({
                         "sender": sender_name,
                         "time": datetime.now().strftime("%H:%M"),
                         "kind": "🎥 Video Message",
