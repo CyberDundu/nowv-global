@@ -711,6 +711,133 @@ def send_dm_message(
     return saved_message
 
 
+
+def send_dm_voice_message(
+    thread_id: str,
+    current_user: dict,
+    audio_bytes: bytes,
+    mime_type: str,
+    source_lang: str,
+    reply_to_message_id: int | None = None,
+) -> dict:
+    """Save a voice note with transcription and recipient-language translation."""
+    current_id = clean_nowv_id(str(current_user.get("nowv_id") or ""))
+    if not current_id or not audio_bytes:
+        raise ValueError("A signed-in account and a voice recording are required.")
+    if len(audio_bytes) > MAX_MEDIA_BYTES:
+        raise ValueError("Voice recording exceeds the 50 MB upload limit.")
+    if source_lang not in LANGUAGES:
+        raise ValueError("Please select a supported language.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+    if not threads:
+        raise ValueError("Conversation not found.")
+
+    thread = threads[0]
+    if current_id not in (thread.get("user_a"), thread.get("user_b")):
+        raise PermissionError("You cannot access this conversation.")
+
+    receiver_id = (
+        thread["user_b"] if current_id == thread["user_a"]
+        else thread["user_a"]
+    )
+    receiver_rows = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"eq.{receiver_id}",
+            "select": "nowv_id,preferred_lang",
+            "limit": "1",
+        },
+    )
+    if not receiver_rows:
+        raise ValueError("The recipient account could not be found.")
+
+    receiver_lang = receiver_rows[0].get("preferred_lang") or "English"
+
+    reply_id = None
+    if reply_to_message_id is not None:
+        reply_id = int(reply_to_message_id)
+        reply_rows = db_select(
+            "nowv_dm_messages",
+            {
+                "id": f"eq.{reply_id}",
+                "thread_id": f"eq.{thread_id}",
+                "select": "id,deleted_at",
+                "limit": "1",
+            },
+        )
+        if not reply_rows or reply_rows[0].get("deleted_at"):
+            raise ValueError("The reply message is unavailable.")
+
+    transcript, translated = translate_media_or_audio(
+        audio_bytes, mime_type, source_lang, receiver_lang
+    )
+    if not transcript and not translated:
+        raise ValueError("No speech could be recognized. Please try again.")
+
+    suffix = {
+        "audio/wav": "wav",
+        "audio/x-wav": "wav",
+        "audio/webm": "webm",
+        "audio/mp4": "m4a",
+        "audio/mpeg": "mp3",
+        "audio/ogg": "ogg",
+    }.get(mime_type, "wav")
+
+    media_path = upload_media(
+        f"dm/{thread_id}", audio_bytes, mime_type, suffix
+    )
+
+    speech_path = None
+    if translated:
+        translated_audio = generate_speech_bytes(translated, receiver_lang)
+        if translated_audio:
+            try:
+                speech_path = upload_media(
+                    f"dm/{thread_id}",
+                    translated_audio,
+                    "audio/mpeg",
+                    "mp3",
+                )
+            except Exception:
+                speech_path = None
+
+    saved = db_insert(
+        "nowv_dm_messages",
+        {
+            "thread_id": thread_id,
+            "sender_nowv_id": current_id,
+            "original_text": transcript,
+            "translated_text": translated,
+            "source_lang": source_lang,
+            "target_lang": receiver_lang,
+            "kind": "Voice",
+            "media_path": media_path,
+            "media_mime": mime_type,
+            "speech_path": speech_path,
+            "reply_to_message_id": reply_id,
+        },
+    )
+
+    db_update(
+        "nowv_dm_threads",
+        {"thread_id": f"eq.{thread_id}"},
+        {
+            "last_message": ("🎙️ " + (transcript or "Voice message"))[:200],
+            "last_message_sender_id": current_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return saved
+
+
 def mark_dm_thread_read(thread_id: str, current_nowv_id: str) -> None:
     current_id = clean_nowv_id(current_nowv_id)
     safe_thread_id = str(thread_id or "").strip()
@@ -1531,15 +1658,103 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                 if deleted:
                                     st.caption("This message was deleted.")
                                 else:
-                                    st.write(dm_message.get("original_text", ""))
+                                    message_kind = str(
+                                        dm_message.get("kind") or "Text"
+                                    ).lower()
+                                    original = dm_message.get("original_text") or ""
+                                    translated = dm_message.get("translated_text") or ""
 
-                                    translated = dm_message.get("translated_text")
-                                    original = dm_message.get("original_text")
-                                    if translated and translated != original:
-                                        st.caption(
-                                            f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                    is_voice_message = (
+                                        message_kind == "voice"
+                                        or bool(dm_message.get("media_path"))
+                                    )
+                                    if is_voice_message:
+                                        st.caption("🎙️ Voice message")
+                                        media_path = dm_message.get("media_path")
+                                        media_mime = (
+                                            dm_message.get("media_mime") or "audio/wav"
                                         )
-                                        st.write(translated)
+
+                                        if media_path:
+                                            try:
+                                                voice_bytes = download_media(media_path)
+                                                if voice_bytes:
+                                                    st.audio(
+                                                        voice_bytes,
+                                                        format=media_mime,
+                                                    )
+                                            except Exception as audio_exc:
+                                                st.caption(
+                                                    f"Original audio unavailable: {audio_exc}"
+                                                )
+
+                                        if original:
+                                            st.caption(
+                                                f"Transcription ({dm_message.get('source_lang', 'original')}):"
+                                            )
+                                            st.write(original)
+
+                                        if translated and translated != original:
+                                            st.caption(
+                                                f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                            )
+                                            st.write(translated)
+
+                                        speech_path = dm_message.get("speech_path")
+                                        if speech_path:
+                                            try:
+                                                speech_bytes = download_media(speech_path)
+                                                if speech_bytes:
+                                                    st.caption("🔊 Translated audio")
+                                                    st.audio(
+                                                        speech_bytes,
+                                                        format="audio/mpeg",
+                                                    )
+                                            except Exception:
+                                                st.caption(
+                                                    "Translated audio is temporarily unavailable."
+                                                )
+                                    else:
+                                        st.write(original)
+                                        if translated and translated != original:
+                                            st.caption(
+                                                f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                            )
+                                            st.write(translated)
+                                            if not is_mine:
+                                                t_col1, t_col2 = st.columns([1, 1.3])
+                                                with t_col1:
+                                                    if st.button(
+                                                        "🔊 Listen",
+                                                        key=f"dm_tts_{thread_id}_{message_id}",
+                                                    ):
+                                                        tts_bytes = generate_speech_bytes(
+                                                            translated,
+                                                            dm_message.get("target_lang", "English"),
+                                                        )
+                                                        if tts_bytes:
+                                                            st.audio(
+                                                                tts_bytes,
+                                                                format="audio/mpeg",
+                                                            )
+                                                with t_col2:
+                                                    if st.button(
+                                                        "🔍 Verify Meaning",
+                                                        key=f"dm_verify_{thread_id}_{message_id}",
+                                                    ):
+                                                        try:
+                                                            verified = translate_chat_text(
+                                                                translated,
+                                                                dm_message.get("target_lang", "English"),
+                                                                dm_message.get("source_lang", "English"),
+                                                            )
+                                                            st.caption(
+                                                                f"Back-translation: {verified}"
+                                                            )
+                                                        except Exception as verify_exc:
+                                                            st.caption(
+                                                                f"Verification unavailable: {verify_exc}"
+                                                            )
 
                                 if is_mine:
                                     st.caption(
@@ -1652,6 +1867,56 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Message could not be sent: {exc}")
+                    with st.expander("🎙️ Record a voice note"):
+                        st.caption(
+                            "Record in your selected language. NowV will transcribe "
+                            "and translate it for the recipient."
+                        )
+                        audio_file = st.audio_input(
+                            "Record a voice note",
+                            key=f"dm_voice_input_{active_thread_id}",
+                        )
+
+                        if audio_file is not None:
+                            audio_data = audio_file.getvalue()
+                            audio_mime = audio_file.type or "audio/wav"
+                            audio_hash = hashlib.sha256(audio_data).hexdigest()
+                            sent_hash_key = f"dm_voice_sent_{active_thread_id}"
+
+                            if audio_data:
+                                st.audio(audio_data, format=audio_mime)
+
+                                if st.button(
+                                    "Send voice note",
+                                    key=f"dm_voice_send_{active_thread_id}",
+                                    type="primary",
+                                ):
+                                    if st.session_state.get(sent_hash_key) == audio_hash:
+                                        st.info("This recording has already been sent.")
+                                    else:
+                                        try:
+                                            voice_source_lang = st.session_state.get(
+                                                f"dm_language_{active_thread_id}",
+                                                current_user.get("preferred_lang", "English"),
+                                            )
+                                            send_dm_voice_message(
+                                                active_thread_id,
+                                                current_user,
+                                                audio_data,
+                                                audio_mime,
+                                                voice_source_lang,
+                                                reply_state.get("message_id")
+                                                if reply_state else None,
+                                            )
+                                            st.session_state[sent_hash_key] = audio_hash
+                                            st.session_state.pop("nowv_dm_reply", None)
+                                            st.success("Voice note sent.")
+                                            st.rerun()
+                                        except Exception as voice_exc:
+                                            st.error(
+                                                f"Voice note could not be sent: {voice_exc}"
+                                            )
+
 
             else:
                 st.info(
