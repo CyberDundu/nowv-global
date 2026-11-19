@@ -6,9 +6,16 @@ import uuid
 import html
 import secrets
 import hashlib
+
+from argon2 import PasswordHasher
+from argon2.exceptions import (
+    VerifyMismatchError,
+    VerificationError,
+    InvalidHashError,
+)
 from pathlib import Path
 from urllib.parse import urlencode, quote
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import streamlit as st
@@ -160,6 +167,240 @@ def db_update(table: str, filters: dict, payload: dict) -> None:
         raise sb_error(response, "update")
 
 
+
+# ==========================================
+# NOWV ACCOUNTS — PASSWORD SECURITY
+# ==========================================
+
+password_hasher = PasswordHasher()
+
+
+def clean_nowv_id(value: str) -> str:
+    value = str(value or "").upper().strip()
+    return "".join(c for c in value if c.isalnum() or c == "-")[:40]
+
+
+def register_nowv_user(
+    display_name: str,
+    preferred_lang: str,
+    password: str,
+) -> dict:
+    display_name = str(display_name or "").strip()
+
+    if len(display_name) < 2 or len(display_name) > 40:
+        raise ValueError("Your display name must be 2–40 characters.")
+
+    if preferred_lang not in LANGUAGES:
+        raise ValueError("Please select a supported language.")
+
+    if len(password) < 8:
+        raise ValueError("Your password must contain at least 8 characters.")
+
+    password_hash = password_hasher.hash(password)
+
+    for _ in range(5):
+        nowv_id = "NOWV-" + secrets.token_hex(4).upper()
+
+        try:
+            user = db_insert(
+                "nowv_users",
+                {
+                    "nowv_id": nowv_id,
+                    "display_name": display_name,
+                    "preferred_lang": preferred_lang,
+                    "password_hash": password_hash,
+                },
+            )
+            return {
+                "nowv_id": user.get("nowv_id", nowv_id),
+                "display_name": user.get("display_name", display_name),
+                "preferred_lang": user.get("preferred_lang", preferred_lang),
+            }
+        except RuntimeError as exc:
+            error = str(exc).lower()
+            if "23505" not in error and "duplicate key" not in error:
+                raise
+
+    raise RuntimeError("Could not generate a unique NowV ID. Please try again.")
+
+
+class LoginLockedError(Exception):
+    def __init__(self, minutes_remaining: int):
+        self.minutes_remaining = minutes_remaining
+        super().__init__(
+            f"Too many failed attempts. Try again in approximately "
+            f"{minutes_remaining} minute(s)."
+        )
+
+
+def authenticate_nowv_user(nowv_id: str, password: str) -> dict | None:
+    nowv_id = clean_nowv_id(nowv_id)
+
+    if not nowv_id or not password:
+        return None
+
+    locked, minutes_remaining = check_login_lockout(nowv_id)
+    if locked:
+        raise LoginLockedError(minutes_remaining)
+
+    rows = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"eq.{nowv_id}",
+            "select": "nowv_id,display_name,preferred_lang,password_hash",
+            "limit": "1",
+        },
+    )
+
+    if not rows:
+        record_failed_login(nowv_id)
+        return None
+
+    user = rows[0]
+    stored_hash = str(user.get("password_hash") or "")
+
+    if not stored_hash:
+        record_failed_login(nowv_id)
+        return None
+
+    try:
+        password_hasher.verify(stored_hash, password)
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        record_failed_login(nowv_id)
+        return None
+
+    if password_hasher.check_needs_rehash(stored_hash):
+        db_update(
+            "nowv_users",
+            {"nowv_id": f"eq.{nowv_id}"},
+            {"password_hash": password_hasher.hash(password)},
+        )
+
+    reset_login_attempts(nowv_id)
+
+    return {
+        "nowv_id": user["nowv_id"],
+        "display_name": user["display_name"],
+        "preferred_lang": user["preferred_lang"],
+    }
+
+
+# ==========================================
+# LOGIN RATE LIMITING — SUPABASE
+# ==========================================
+
+MAX_LOGIN_FAILURES = 5
+LOGIN_LOCKOUT_MINUTES = 15
+
+
+def login_attempt_key(nowv_id: str) -> str:
+    normalized = clean_nowv_id(nowv_id)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def check_login_lockout(nowv_id: str) -> tuple[bool, int]:
+    key = login_attempt_key(nowv_id)
+
+    rows = db_select(
+        "nowv_login_attempts",
+        {
+            "attempt_key": f"eq.{key}",
+            "select": "failed_attempts,locked_until",
+            "limit": "1",
+        },
+    )
+
+    if not rows:
+        return False, 0
+
+    row = rows[0]
+    locked_until = row.get("locked_until")
+
+    if not locked_until:
+        return False, 0
+
+    lock_time = datetime.fromisoformat(
+        locked_until.replace("Z", "+00:00")
+    )
+    now = datetime.now(timezone.utc)
+
+    if lock_time > now:
+        remaining = max(
+            1,
+            int((lock_time - now).total_seconds() / 60) + 1,
+        )
+        return True, remaining
+
+    reset_login_attempts(nowv_id)
+    return False, 0
+def record_failed_login(nowv_id: str) -> tuple[bool, int]:
+    key = login_attempt_key(nowv_id)
+
+    rows = db_select(
+        "nowv_login_attempts",
+        {
+            "attempt_key": f"eq.{key}",
+            "select": "failed_attempts",
+            "limit": "1",
+        },
+    )
+
+    failures = int(rows[0]["failed_attempts"]) + 1 if rows else 1
+
+    locked_until = None
+    if failures >= MAX_LOGIN_FAILURES:
+        locked_until = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+        ).isoformat()
+
+    payload = {
+        "attempt_key": key,
+        "failed_attempts": failures,
+        "locked_until": locked_until,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if rows:
+        db_update(
+            "nowv_login_attempts",
+            {"attempt_key": f"eq.{key}"},
+            {
+                "failed_attempts": failures,
+                "locked_until": locked_until,
+                "updated_at": payload["updated_at"],
+            },
+        )
+    else:
+        db_insert("nowv_login_attempts", payload)
+
+    return failures >= MAX_LOGIN_FAILURES, failures
+
+
+def reset_login_attempts(nowv_id: str) -> None:
+    key = login_attempt_key(nowv_id)
+
+    rows = db_select(
+        "nowv_login_attempts",
+        {
+            "attempt_key": f"eq.{key}",
+            "select": "attempt_key",
+            "limit": "1",
+        },
+    )
+
+    if rows:
+        db_update(
+            "nowv_login_attempts",
+            {"attempt_key": f"eq.{key}"},
+            {
+                "failed_attempts": 0,
+                "locked_until": None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+
 # ==========================================
 # ROOM MANAGEMENT — SUPABASE
 # ==========================================
@@ -238,6 +479,299 @@ def save_participant_language(room_id: str, side: str, language: str) -> None:
         {"room_id": f"eq.{room_id}"},
         {column: language},
     )
+
+
+# ==========================================
+# DIRECT MESSAGES — PRIVATE CONVERSATIONS
+# ==========================================
+
+def search_nowv_users(search_id: str, current_nowv_id: str) -> list[dict]:
+    """Find registered users by exact NowV ID without exposing private fields."""
+    target_id = clean_nowv_id(search_id)
+    current_id = clean_nowv_id(current_nowv_id)
+
+    if not target_id or target_id == current_id:
+        return []
+
+    rows = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"eq.{target_id}",
+            "select": "nowv_id,display_name,preferred_lang",
+            "limit": "1",
+        },
+    )
+    return rows
+
+
+def get_or_create_dm_thread(current_nowv_id: str, other_nowv_id: str) -> dict:
+    """Return the one permanent private thread shared by two users."""
+    current_id = clean_nowv_id(current_nowv_id)
+    other_id = clean_nowv_id(other_nowv_id)
+
+    if not current_id or not other_id:
+        raise ValueError("Both NowV IDs are required.")
+
+    if current_id == other_id:
+        raise ValueError("You cannot start a conversation with yourself.")
+
+    # Verify both accounts exist.
+    users = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"in.({current_id},{other_id})",
+            "select": "nowv_id",
+            "limit": "2",
+        },
+    )
+    found_ids = {row.get("nowv_id") for row in users}
+    if current_id not in found_ids or other_id not in found_ids:
+        raise ValueError("One or both NowV accounts could not be found.")
+
+    user_a, user_b = sorted((current_id, other_id))
+
+    existing = db_select(
+        "nowv_dm_threads",
+        {
+            "user_a": f"eq.{user_a}",
+            "user_b": f"eq.{user_b}",
+            "select": "*",
+            "limit": "1",
+        },
+    )
+    if existing:
+        return existing[0]
+
+    thread_id = "NOWVDM-" + uuid.uuid4().hex[:16].upper()
+
+    try:
+        return db_insert(
+            "nowv_dm_threads",
+            {
+                "thread_id": thread_id,
+                "user_a": user_a,
+                "user_b": user_b,
+                "last_message": "",
+            },
+        )
+    except Exception:
+        # A simultaneous request may have created the same user pair.
+        existing = db_select(
+            "nowv_dm_threads",
+            {
+                "user_a": f"eq.{user_a}",
+                "user_b": f"eq.{user_b}",
+                "select": "*",
+                "limit": "1",
+            },
+        )
+        if existing:
+            return existing[0]
+        raise
+
+
+def fetch_dm_messages(thread_id: str, current_nowv_id: str) -> list[dict]:
+    """Fetch messages only when the current account belongs to the thread."""
+    current_id = clean_nowv_id(current_nowv_id)
+    safe_thread_id = str(thread_id or "").strip()
+
+    if not current_id or not safe_thread_id:
+        raise ValueError("A valid account and conversation are required.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{safe_thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+
+    if not threads:
+        raise ValueError("Conversation not found.")
+
+    thread = threads[0]
+    if current_id not in (thread.get("user_a"), thread.get("user_b")):
+        raise PermissionError("You do not have access to this conversation.")
+
+    return db_select(
+        "nowv_dm_messages",
+        {
+            "thread_id": f"eq.{safe_thread_id}",
+            "select": "*",
+            "order": "id.asc",
+            "limit": str(MAX_MESSAGES),
+        },
+    )
+
+
+def send_dm_message(
+    thread_id: str,
+    current_user: dict,
+    message_text: str,
+    source_lang: str,
+) -> dict:
+    """Translate and save a text message in an authorized private thread."""
+    current_id = clean_nowv_id(str(current_user.get("nowv_id") or ""))
+    text = str(message_text or "").strip()
+
+    if not current_id:
+        raise ValueError("Please sign in before sending a message.")
+
+    if not text:
+        raise ValueError("Message cannot be empty.")
+
+    if len(text) > 10000:
+        raise ValueError("Message is too long. Maximum length is 10,000 characters.")
+
+    if source_lang not in LANGUAGES:
+        raise ValueError("Please select a supported language.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+
+    if not threads:
+        raise ValueError("Conversation not found.")
+
+    thread = threads[0]
+    if current_id not in (thread.get("user_a"), thread.get("user_b")):
+        raise PermissionError("You do not have access to this conversation.")
+
+    receiver_id = (
+        thread["user_b"] if current_id == thread["user_a"]
+        else thread["user_a"]
+    )
+
+    receiver_rows = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"eq.{receiver_id}",
+            "select": "nowv_id,preferred_lang",
+            "limit": "1",
+        },
+    )
+
+    if not receiver_rows:
+        raise ValueError("The other participant's account could not be found.")
+
+    receiver_lang = receiver_rows[0].get("preferred_lang") or "English"
+
+    translated = translate_chat_text(text, source_lang, receiver_lang)
+
+    saved_message = db_insert(
+        "nowv_dm_messages",
+        {
+            "thread_id": thread_id,
+            "sender_nowv_id": current_id,
+            "original_text": text,
+            "translated_text": translated,
+            "source_lang": source_lang,
+            "target_lang": receiver_lang,
+            "kind": "Text",
+        },
+    )
+
+    db_update(
+        "nowv_dm_threads",
+        {"thread_id": f"eq.{thread_id}"},
+        {
+            "last_message": text[:200],
+            "last_message_sender_id": current_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    return saved_message
+
+
+def mark_dm_thread_read(thread_id: str, current_nowv_id: str) -> None:
+    current_id = clean_nowv_id(current_nowv_id)
+    safe_thread_id = str(thread_id or "").strip()
+
+    if not current_id or not safe_thread_id:
+        raise ValueError("Invalid conversation or user ID.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{safe_thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+
+    if not threads:
+        raise ValueError("Conversation not found.")
+
+    thread = threads[0]
+
+    if current_id == thread["user_a"]:
+        read_column = "user_a_last_read_at"
+    elif current_id == thread["user_b"]:
+        read_column = "user_b_last_read_at"
+    else:
+        raise PermissionError("You are not a member of this conversation.")
+
+    db_update(
+        "nowv_dm_threads",
+        {"thread_id": f"eq.{safe_thread_id}"},
+        {read_column: datetime.now(timezone.utc).isoformat()},
+    )
+
+
+def fetch_dm_threads(current_nowv_id: str) -> list[dict]:
+    """Fetch every private conversation belonging to the signed-in user."""
+    current_id = clean_nowv_id(current_nowv_id)
+    if not current_id:
+        raise ValueError("Please sign in to view your conversations.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "or": f"(user_a.eq.{current_id},user_b.eq.{current_id})",
+            "select": "thread_id,user_a,user_b,last_message,updated_at,last_message_sender_id,user_a_last_read_at,user_b_last_read_at",
+            "order": "updated_at.desc",
+            "limit": "100",
+        },
+    )
+
+    other_ids = {
+        thread["user_b"] if thread["user_a"] == current_id else thread["user_a"]
+        for thread in threads
+    }
+
+    if not other_ids:
+        return []
+
+    users = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"in.({','.join(sorted(other_ids))})",
+            "select": "nowv_id,display_name,preferred_lang",
+        },
+    )
+
+    users_by_id = {user["nowv_id"]: user for user in users}
+
+    for thread in threads:
+        other_id = (
+            thread["user_b"]
+            if thread["user_a"] == current_id
+            else thread["user_a"]
+        )
+        thread["other_user"] = users_by_id.get(other_id, {
+            "nowv_id": other_id,
+            "display_name": other_id,
+            "preferred_lang": "English",
+        })
+
+    return threads
 
 
 # ==========================================
@@ -530,6 +1064,417 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+# ==========================================
+# NOWV APP MODE — ROOM OR DIRECT MESSAGES
+# ==========================================
+
+query_room = clean_room_id(st.query_params.get("room", ""))
+
+if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
+    st.markdown("## Welcome to NowV")
+    st.caption("Choose how you want to communicate.")
+
+    app_mode = st.radio(
+        "Messenger",
+        ["Room Messenger", "Direct Messages"],
+        horizontal=True,
+        key="nowv_app_mode",
+    )
+
+    if app_mode == "Direct Messages":
+        st.markdown("### Your NowV Account")
+
+        current_user = st.session_state.get("nowv_user")
+
+        if current_user:
+            if st.session_state.pop("nowv_account_created", False):
+                st.success("Your NowV account was created successfully.")
+
+            st.success(
+                f"Signed in as {current_user['display_name']} "
+                f"({current_user['nowv_id']})"
+            )
+            st.caption(
+                f"Default language: {current_user['preferred_lang']}"
+            )
+
+            if st.button("Log Out", use_container_width=True):
+                st.session_state.pop("nowv_user", None)
+                st.rerun()
+
+            st.markdown("### Find People")
+            with st.form("nowv_find_user_form", clear_on_submit=True):
+                search_id = st.text_input(
+                    "Search by NowV ID",
+                    placeholder="NOWV-XXXXXXXX",
+                )
+                search_submit = st.form_submit_button(
+                    "Find User",
+                    use_container_width=True,
+                )
+
+            if search_submit:
+                try:
+                    matches = search_nowv_users(
+                        search_id,
+                        current_user["nowv_id"],
+                    )
+                    if matches:
+                        st.session_state["nowv_found_user"] = matches[0]
+                    else:
+                        st.session_state.pop("nowv_found_user", None)
+                        st.warning("No account found with that NowV ID.")
+                except Exception as exc:
+                    st.error(f"User search failed: {exc}")
+
+            found_user = st.session_state.get("nowv_found_user")
+            if found_user:
+                st.markdown("#### Search Result")
+                st.write(f"**{found_user['display_name']}**")
+                st.caption(
+                    f"{found_user['nowv_id']} · "
+                    f"Language: {found_user['preferred_lang']}"
+                )
+                if st.button(
+                    "Message This User",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        thread = get_or_create_dm_thread(
+                            current_user["nowv_id"],
+                            found_user["nowv_id"],
+                        )
+                        st.session_state["nowv_active_dm"] = thread["thread_id"]
+                        st.success("Private conversation opened.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not open conversation: {exc}")
+
+            st.divider()
+
+            @st.fragment(run_every=3)
+            def render_dm_conversations(user_id):
+                st.markdown("### Your Conversations")
+
+                try:
+                    threads = fetch_dm_threads(user_id)
+                except Exception as exc:
+                    st.error(f"Could not load conversations: {exc}")
+                    return
+
+                if not threads:
+                    st.info(
+                        "No private conversations yet. Find someone by "
+                        "their NowV ID to start a conversation."
+                    )
+                    return
+
+                for dm_thread in threads:
+                    other_user = dm_thread["other_user"]
+                    thread_id = dm_thread["thread_id"]
+                    is_active = (
+                        st.session_state.get("nowv_active_dm") == thread_id
+                    )
+
+                    preview = (
+                        dm_thread.get("last_message") or "Start a conversation"
+                    ).replace("\\n", " ").strip()
+
+                    if len(preview) > 65:
+                        preview = preview[:62] + "..."
+
+                    updated = dm_thread.get("updated_at", "")
+                    try:
+                        stamp = datetime.fromisoformat(
+                            updated.replace("Z", "+00:00")
+                        ).astimezone().strftime("%d %b · %H:%M")
+                    except (ValueError, TypeError, AttributeError):
+                        stamp = ""
+
+                    current_id = clean_nowv_id(user_id)
+                    read_field = (
+                        "user_a_last_read_at"
+                        if current_id == dm_thread.get("user_a")
+                        else "user_b_last_read_at"
+                    )
+                    last_read = dm_thread.get(read_field)
+                    unread = False
+
+                    if (
+                        dm_thread.get("last_message_sender_id")
+                        and dm_thread.get("last_message_sender_id") != current_id
+                        and updated
+                    ):
+                        try:
+                            message_time = datetime.fromisoformat(
+                                updated.replace("Z", "+00:00")
+                            )
+                            read_time = (
+                                datetime.fromisoformat(
+                                    last_read.replace("Z", "+00:00")
+                                )
+                                if last_read else None
+                            )
+                            if message_time.tzinfo is None:
+                                message_time = message_time.replace(
+                                    tzinfo=timezone.utc
+                                )
+                            if read_time and read_time.tzinfo is None:
+                                read_time = read_time.replace(
+                                    tzinfo=timezone.utc
+                                )
+                            unread = (
+                                read_time is None or message_time > read_time
+                            )
+                        except (ValueError, TypeError, AttributeError):
+                            unread = False
+
+                    label = (
+                        f"{'✓ ' if is_active else ''}"
+                        f"{'🔵 ' if unread else ''}"
+                        f"{other_user['display_name']} · "
+                        f"{other_user['nowv_id']}\n"
+                        f"{preview}  ·  {stamp}"
+                    )
+
+                    if st.button(
+                        label,
+                        key=f"open_dm_{thread_id}",
+                        use_container_width=True,
+                        type="primary" if is_active else "secondary",
+                    ):
+                        st.session_state["nowv_active_dm"] = thread_id
+                        st.rerun()
+
+            render_dm_conversations(current_user["nowv_id"])
+
+            try:
+                dm_threads = fetch_dm_threads(current_user["nowv_id"])
+            except Exception as exc:
+                dm_threads = []
+                st.error(f"Could not load active conversation: {exc}")
+
+            if dm_threads:
+                active_thread_id = st.session_state.get("nowv_active_dm")
+                active_thread = next(
+                    (
+                        item for item in dm_threads
+                        if item["thread_id"] == active_thread_id
+                    ),
+                    None,
+                )
+
+                if active_thread:
+                    current_id = clean_nowv_id(current_user["nowv_id"])
+                    read_field = (
+                        "user_a_last_read_at"
+                        if current_id == active_thread.get("user_a")
+                        else "user_b_last_read_at"
+                    )
+                    last_read = active_thread.get(read_field)
+                    last_sender = active_thread.get("last_message_sender_id")
+                    updated = active_thread.get("updated_at")
+
+                    if last_sender and last_sender != current_id and updated:
+                        try:
+                            message_time = datetime.fromisoformat(
+                                updated.replace("Z", "+00:00")
+                            )
+                            read_time = (
+                                datetime.fromisoformat(
+                                    last_read.replace("Z", "+00:00")
+                                )
+                                if last_read else None
+                            )
+                            if message_time.tzinfo is None:
+                                message_time = message_time.replace(
+                                    tzinfo=timezone.utc
+                                )
+                            if read_time and read_time.tzinfo is None:
+                                read_time = read_time.replace(
+                                    tzinfo=timezone.utc
+                                )
+
+                            if read_time is None or message_time > read_time:
+                                mark_dm_thread_read(
+                                    active_thread_id,
+                                    current_user["nowv_id"],
+                                )
+                        except (ValueError, TypeError, AttributeError) as exc:
+                            st.warning(f"Could not update read status: {exc}")
+
+                    other = active_thread["other_user"]
+                    st.divider()
+                    st.markdown(f"### Chat with {other['display_name']}")
+                    st.caption(
+                        f"{other['nowv_id']} · "
+                        f"Your language: {current_user['preferred_lang']} · "
+                        f"Their language: {other['preferred_lang']}"
+                    )
+
+                    @st.fragment(run_every=2)
+                    def render_dm_messages(thread_id, user_id, other_name):
+                        try:
+                            messages = fetch_dm_messages(thread_id, user_id)
+                        except Exception as exc:
+                            st.error(f"Could not load messages: {exc}")
+                            return
+
+                        for dm_message in messages:
+                            is_mine = (
+                                dm_message["sender_nowv_id"] == user_id
+                            )
+                            sender_label = "You" if is_mine else other_name
+
+                            with st.chat_message(
+                                "user" if is_mine else "assistant"
+                            ):
+                                st.caption(sender_label)
+                                st.write(dm_message["original_text"])
+
+                                translated = dm_message.get("translated_text")
+                                original = dm_message["original_text"]
+
+                                if translated and translated != original:
+                                    st.caption(
+                                        f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                    )
+                                    st.write(translated)
+
+                    render_dm_messages(
+                        active_thread_id,
+                        current_user["nowv_id"],
+                        other["display_name"],
+                    )
+
+                    with st.form(
+                        f"dm_message_form_{active_thread_id}",
+                        clear_on_submit=True,
+                    ):
+                        message_text = st.text_area(
+                            "Message",
+                            placeholder="Type your message...",
+                            max_chars=10000,
+                        )
+                        source_lang = st.selectbox(
+                            "Your message language",
+                            list(LANGUAGES.keys()),
+                            index=(
+                                list(LANGUAGES.keys()).index(
+                                    current_user["preferred_lang"]
+                                )
+                                if current_user["preferred_lang"] in LANGUAGES
+                                else 0
+                            ),
+                            key=f"dm_language_{active_thread_id}",
+                        )
+                        send_submit = st.form_submit_button(
+                            "Send Message",
+                            type="primary",
+                            use_container_width=True,
+                        )
+
+                    if send_submit:
+                        try:
+                            send_dm_message(
+                                active_thread_id,
+                                current_user,
+                                message_text,
+                                source_lang,
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Message could not be sent: {exc}")
+            else:
+                st.info(
+                    "No private conversations yet. Find someone by their "
+                    "NowV ID to start a conversation."
+                )
+
+        else:
+            login_tab, register_tab = st.tabs(
+                ["Log In", "Create Account"]
+            )
+
+            with login_tab:
+                with st.form("nowv_login_form", clear_on_submit=True):
+                    login_id = st.text_input(
+                        "NowV ID",
+                        placeholder="NOWV-XXXXXXXX",
+                    )
+                    login_password = st.text_input(
+                        "Password",
+                        type="password",
+                    )
+                    login_submit = st.form_submit_button(
+                        "Log In",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if login_submit:
+                    try:
+                        user = authenticate_nowv_user(
+                            login_id,
+                            login_password,
+                        )
+                        if user:
+                            st.session_state["nowv_user"] = user
+                            st.rerun()
+                        else:
+                            st.error("Incorrect NowV ID or password.")
+                    except LoginLockedError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"Login failed: {exc}")
+
+            with register_tab:
+                with st.form("nowv_register_form", clear_on_submit=True):
+                    display_name = st.text_input(
+                        "Your display name",
+                        max_chars=40,
+                    )
+                    preferred_lang = st.selectbox(
+                        "Your default language",
+                        list(LANGUAGES.keys()),
+                        index=list(LANGUAGES.keys()).index("English"),
+                    )
+                    new_password = st.text_input(
+                        "Create password",
+                        type="password",
+                    )
+                    confirm_password = st.text_input(
+                        "Confirm password",
+                        type="password",
+                    )
+                    register_submit = st.form_submit_button(
+                        "Create My NowV Account",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if register_submit:
+                    if new_password != confirm_password:
+                        st.error("Your passwords do not match.")
+                    else:
+                        try:
+                            user = register_nowv_user(
+                                display_name,
+                                preferred_lang,
+                                new_password,
+                            )
+                            st.session_state["nowv_user"] = user
+                            st.session_state["nowv_account_created"] = True
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(f"Account creation failed: {exc}")
+
+        st.stop()
 
 
 # ==========================================

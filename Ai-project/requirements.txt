@@ -6,3 +6,4 @@ numpy
 Pillow
 pypdf
 pandas
+argon2-cffi
