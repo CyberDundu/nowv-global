@@ -610,6 +610,7 @@ def send_dm_message(
     current_user: dict,
     message_text: str,
     source_lang: str,
+    reply_to_message_id: int | None = None,
 ) -> dict:
     """Translate and save a text message in an authorized private thread."""
     current_id = clean_nowv_id(str(current_user.get("nowv_id") or ""))
@@ -643,6 +644,25 @@ def send_dm_message(
     if current_id not in (thread.get("user_a"), thread.get("user_b")):
         raise PermissionError("You do not have access to this conversation.")
 
+    if reply_to_message_id is not None:
+        try:
+            reply_id = int(reply_to_message_id)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid reply message.")
+        reply_rows = db_select(
+            "nowv_dm_messages",
+            {
+                "id": f"eq.{reply_id}",
+                "thread_id": f"eq.{thread_id}",
+                "select": "id,deleted_at",
+                "limit": "1",
+            },
+        )
+        if not reply_rows or reply_rows[0].get("deleted_at"):
+            raise ValueError("The message you are replying to is unavailable.")
+    else:
+        reply_id = None
+
     receiver_id = (
         thread["user_b"] if current_id == thread["user_a"]
         else thread["user_a"]
@@ -674,6 +694,7 @@ def send_dm_message(
             "source_lang": source_lang,
             "target_lang": receiver_lang,
             "kind": "Text",
+            "reply_to_message_id": reply_id,
         },
     )
 
@@ -710,7 +731,6 @@ def mark_dm_thread_read(thread_id: str, current_nowv_id: str) -> None:
         raise ValueError("Conversation not found.")
 
     thread = threads[0]
-
     if current_id == thread["user_a"]:
         read_column = "user_a_last_read_at"
     elif current_id == thread["user_b"]:
@@ -718,10 +738,134 @@ def mark_dm_thread_read(thread_id: str, current_nowv_id: str) -> None:
     else:
         raise PermissionError("You are not a member of this conversation.")
 
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Mark every incoming message as read.
+    db_update(
+        "nowv_dm_messages",
+        {
+            "thread_id": f"eq.{safe_thread_id}",
+            "sender_nowv_id": f"neq.{current_id}",
+            "read_at": "is.null",
+        },
+        {"read_at": now},
+    )
+
+    # Preserve the existing conversation-level unread indicator.
     db_update(
         "nowv_dm_threads",
         {"thread_id": f"eq.{safe_thread_id}"},
-        {read_column: datetime.now(timezone.utc).isoformat()},
+        {read_column: now},
+    )
+
+
+def edit_dm_message(
+    thread_id: str,
+    current_nowv_id: str,
+    message_id: int,
+    new_text: str,
+) -> None:
+    current_id = clean_nowv_id(current_nowv_id)
+    text = str(new_text or "").strip()
+
+    if not current_id or not text:
+        raise ValueError("Message and account are required.")
+    if len(text) > 10000:
+        raise ValueError("Message is too long.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+    if not threads or current_id not in (
+        threads[0].get("user_a"), threads[0].get("user_b")
+    ):
+        raise PermissionError("You cannot access this conversation.")
+
+    rows = db_select(
+        "nowv_dm_messages",
+        {
+            "id": f"eq.{int(message_id)}",
+            "thread_id": f"eq.{thread_id}",
+            "select": "id,sender_nowv_id,source_lang,target_lang,deleted_at",
+            "limit": "1",
+        },
+    )
+    if not rows or rows[0].get("deleted_at"):
+        raise ValueError("Message not found or already deleted.")
+    message = rows[0]
+
+    if message.get("sender_nowv_id") != current_id:
+        raise PermissionError("You can only edit your own messages.")
+
+    source_lang = message.get("source_lang") or "English"
+    target_lang = message.get("target_lang") or "English"
+    translated = translate_chat_text(text, source_lang, target_lang)
+
+    db_update(
+        "nowv_dm_messages",
+        {
+            "id": f"eq.{int(message_id)}",
+            "thread_id": f"eq.{thread_id}",
+        },
+        {
+            "original_text": text,
+            "translated_text": translated,
+            "edited_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def delete_dm_message(
+    thread_id: str,
+    current_nowv_id: str,
+    message_id: int,
+) -> None:
+    current_id = clean_nowv_id(current_nowv_id)
+    if not current_id:
+        raise ValueError("Please sign in.")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+    if not threads or current_id not in (
+        threads[0].get("user_a"), threads[0].get("user_b")
+    ):
+        raise PermissionError("You cannot access this conversation.")
+
+    rows = db_select(
+        "nowv_dm_messages",
+        {
+            "id": f"eq.{int(message_id)}",
+            "thread_id": f"eq.{thread_id}",
+            "select": "id,sender_nowv_id,deleted_at",
+            "limit": "1",
+        },
+    )
+    if not rows or rows[0].get("deleted_at"):
+        raise ValueError("Message not found or already deleted.")
+    if rows[0].get("sender_nowv_id") != current_id:
+        raise PermissionError("You can only delete your own messages.")
+
+    db_update(
+        "nowv_dm_messages",
+        {
+            "id": f"eq.{int(message_id)}",
+            "thread_id": f"eq.{thread_id}",
+        },
+        {
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": current_id,
+        },
     )
 
 
@@ -1315,6 +1459,12 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                         f"Their language: {other['preferred_lang']}"
                     )
 
+                    st.text_input(
+                        "Search messages in this conversation",
+                        key=f"dm_search_{active_thread_id}",
+                        placeholder="Search message text...",
+                    )
+
                     @st.fragment(run_every=2)
                     def render_dm_messages(thread_id, user_id, other_name):
                         try:
@@ -1323,32 +1473,147 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                             st.error(f"Could not load messages: {exc}")
                             return
 
-                        for dm_message in messages:
-                            is_mine = (
-                                dm_message["sender_nowv_id"] == user_id
+                        search_term = st.session_state.get(
+                            f"dm_search_{thread_id}", ""
+                        ).strip().casefold()
+
+                        messages_by_id = {
+                            str(message.get("id")): message for message in messages
+                        }
+
+                        visible_messages = []
+                        for message in messages:
+                            searchable = (
+                                str(message.get("original_text") or "")
+                                + " "
+                                + str(message.get("translated_text") or "")
+                            ).casefold()
+                            if not search_term or search_term in searchable:
+                                visible_messages.append(message)
+
+                        if not visible_messages:
+                            st.caption(
+                                "No messages match your search."
+                                if search_term else "No messages yet. Start the conversation."
                             )
+
+                        for dm_message in visible_messages:
+                            message_id = dm_message.get("id")
+                            is_mine = dm_message.get("sender_nowv_id") == user_id
                             sender_label = "You" if is_mine else other_name
+                            deleted = bool(dm_message.get("deleted_at"))
 
-                            with st.chat_message(
-                                "user" if is_mine else "assistant"
-                            ):
-                                st.caption(sender_label)
-                                st.write(dm_message["original_text"])
+                            created = dm_message.get("created_at")
+                            try:
+                                timestamp = datetime.fromisoformat(
+                                    str(created).replace("Z", "+00:00")
+                                ).astimezone().strftime("%b %d, %I:%M %p")
+                            except (ValueError, TypeError):
+                                timestamp = ""
 
-                                translated = dm_message.get("translated_text")
-                                original = dm_message["original_text"]
+                            with st.chat_message("user" if is_mine else "assistant"):
+                                st.caption(
+                                    f"{sender_label} · {timestamp}"
+                                    + (" · Edited" if dm_message.get("edited_at") else "")
+                                )
 
-                                if translated and translated != original:
+                                reply_id = dm_message.get("reply_to_message_id")
+                                if reply_id is not None:
+                                    replied = messages_by_id.get(str(reply_id))
+                                    if replied:
+                                        reply_preview = (
+                                            "Message deleted"
+                                            if replied.get("deleted_at")
+                                            else str(replied.get("original_text") or "")[:160]
+                                        )
+                                        st.caption(f"↪ Replying to: {reply_preview}")
+
+                                if deleted:
+                                    st.caption("This message was deleted.")
+                                else:
+                                    st.write(dm_message.get("original_text", ""))
+
+                                    translated = dm_message.get("translated_text")
+                                    original = dm_message.get("original_text")
+                                    if translated and translated != original:
+                                        st.caption(
+                                            f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                        )
+                                        st.write(translated)
+
+                                if is_mine:
                                     st.caption(
-                                        f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                        "✓✓ Read" if dm_message.get("read_at") else "✓ Sent"
                                     )
-                                    st.write(translated)
+
+                                if not deleted:
+                                    if st.button(
+                                        "Reply",
+                                        key=f"dm_reply_{thread_id}_{message_id}",
+                                    ):
+                                        st.session_state["nowv_dm_reply"] = {
+                                            "thread_id": thread_id,
+                                            "message_id": message_id,
+                                            "preview": str(
+                                                dm_message.get("original_text") or ""
+                                            )[:100],
+                                        }
+                                        st.rerun()
+
+                                    if is_mine:
+                                        with st.expander("Edit message"):
+                                            with st.form(
+                                                f"dm_edit_form_{thread_id}_{message_id}"
+                                            ):
+                                                edited_text = st.text_area(
+                                                    "Updated message",
+                                                    value=dm_message.get("original_text", ""),
+                                                    max_chars=10000,
+                                                    key=f"dm_edit_text_{thread_id}_{message_id}",
+                                                )
+                                                edit_submit = st.form_submit_button("Save edit")
+
+                                            if edit_submit:
+                                                try:
+                                                    edit_dm_message(
+                                                        thread_id,
+                                                        user_id,
+                                                        message_id,
+                                                        edited_text,
+                                                    )
+                                                    st.success("Message updated.")
+                                                    st.rerun()
+                                                except Exception as exc:
+                                                    st.error(f"Could not edit message: {exc}")
+
+                                        if st.button(
+                                            "Delete message",
+                                            key=f"dm_delete_{thread_id}_{message_id}",
+                                        ):
+                                            try:
+                                                delete_dm_message(
+                                                    thread_id, user_id, message_id
+                                                )
+                                                st.success("Message deleted.")
+                                                st.rerun()
+                                            except Exception as exc:
+                                                st.error(f"Could not delete message: {exc}")
+
 
                     render_dm_messages(
                         active_thread_id,
                         current_user["nowv_id"],
                         other["display_name"],
                     )
+
+                    reply_state = st.session_state.get("nowv_dm_reply")
+                    if reply_state and reply_state.get("thread_id") == active_thread_id:
+                        st.info(f"Replying to: {reply_state.get('preview', '')}")
+                        if st.button("Cancel reply", key=f"dm_cancel_reply_{active_thread_id}"):
+                            st.session_state.pop("nowv_dm_reply", None)
+                            st.rerun()
+                    else:
+                        reply_state = None
 
                     with st.form(
                         f"dm_message_form_{active_thread_id}",
@@ -1363,11 +1628,8 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                             "Your message language",
                             list(LANGUAGES.keys()),
                             index=(
-                                list(LANGUAGES.keys()).index(
-                                    current_user["preferred_lang"]
-                                )
-                                if current_user["preferred_lang"] in LANGUAGES
-                                else 0
+                                list(LANGUAGES.keys()).index(current_user["preferred_lang"])
+                                if current_user["preferred_lang"] in LANGUAGES else 0
                             ),
                             key=f"dm_language_{active_thread_id}",
                         )
@@ -1384,10 +1646,13 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                 current_user,
                                 message_text,
                                 source_lang,
+                                reply_state.get("message_id") if reply_state else None,
                             )
+                            st.session_state.pop("nowv_dm_reply", None)
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Message could not be sent: {exc}")
+
             else:
                 st.info(
                     "No private conversations yet. Find someone by their "
