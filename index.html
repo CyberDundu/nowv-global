@@ -34,8 +34,18 @@
             <a href="#contact">Contact</a>
         </nav>
 
+        <label class="language-control" for="language-select">
+            <span class="language-icon" aria-hidden="true">◎</span>
+            <select id="language-select" aria-label="Choose website language">
+                <option value="en">English</option>
+                <option value="ha">Hausa</option>
+                <option value="yo">Yorùbá</option>
+                <option value="ig">Igbo</option>
+                <option value="zh-CN">简体中文</option>
+            </select>
+        </label>
         <a href="#contact" class="nav-button">
-            Get Started
+            <span data-i18n="nav_get_started">Get Started</span>
         </a>
 
     </header>
@@ -714,6 +724,28 @@
     </footer>
 
 
+
+<div id="language-welcome" class="language-welcome" hidden>
+    <div class="language-welcome-panel" role="dialog" aria-modal="true" aria-labelledby="language-welcome-title">
+        <button type="button" class="language-welcome-close" data-welcome-close aria-label="Continue in English" title="Close">&times;</button>
+        <img src="nowv-wordmark-transparent.png" alt="NowV Global" class="language-welcome-logo">
+        <p class="language-welcome-eyebrow">TRADE WITH CONFIDENCE</p>
+        <h2 id="language-welcome-title">Choose your language</h2>
+        <p class="language-welcome-description">Choose your preferred language to continue.</p>
+
+        <div class="language-welcome-options">
+            <button type="button" data-welcome-language="en"><span>English</span><span class="language-native">English</span></button>
+            <button type="button" data-welcome-language="ha"><span>Hausa</span><span class="language-native">Hausa</span></button>
+            <button type="button" data-welcome-language="yo"><span>Yorùbá</span><span class="language-native">Èdè Yorùbá</span></button>
+            <button type="button" data-welcome-language="ig"><span>Igbo</span><span class="language-native">Asụsụ Igbo</span></button>
+            <button type="button" data-welcome-language="zh-CN"><span>简体中文</span><span class="language-native">中文</span></button>
+        </div>
+
+        <p class="language-welcome-footer">You can change your language anytime.</p>
+    </div>
+</div>
+
+<script src="language.js"></script>
     <script src="script.js"></script>
 
 </body>
