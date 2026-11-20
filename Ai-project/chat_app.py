@@ -169,6 +169,170 @@ def db_update(table: str, filters: dict, payload: dict) -> None:
 
 
 # ==========================================
+
+
+# ==========================================
+# NOWV MESSAGE REACTIONS — ROOM + DM
+# ==========================================
+
+NOWV_REACTION_EMOJIS = ("❤️", "😂", "👍", "😮", "😢", "🔥")
+
+
+def fetch_message_reactions(chat_type: str, chat_id: str) -> dict:
+    if chat_type not in ("room", "dm"):
+        raise ValueError("Invalid chat type.")
+
+    rows = db_select(
+        "nowv_message_reactions",
+        {
+            "select": "message_id,user_id,emoji",
+            "chat_type": f"eq.{chat_type}",
+            "chat_id": f"eq.{chat_id}",
+            "limit": "5000",
+        },
+    )
+
+    grouped = {}
+    for row in rows:
+        message_key = str(row.get("message_id"))
+        grouped.setdefault(message_key, []).append(row)
+
+    return grouped
+
+
+def toggle_message_reaction(
+    chat_type: str,
+    chat_id: str,
+    message_id,
+    user_id: str,
+    emoji: str,
+) -> None:
+    if chat_type not in ("room", "dm"):
+        raise ValueError("Invalid chat type.")
+
+    if emoji not in NOWV_REACTION_EMOJIS:
+        raise ValueError("Invalid reaction.")
+
+    if not chat_id or not user_id or message_id is None:
+        raise ValueError("Missing conversation or message information.")
+
+    message_table = (
+        "nowv_messages" if chat_type == "room" else "nowv_dm_messages"
+    )
+    conversation_column = "room_id" if chat_type == "room" else "thread_id"
+
+    message_rows = db_select(
+        message_table,
+        {
+            "select": "id",
+            "id": f"eq.{message_id}",
+            conversation_column: f"eq.{chat_id}",
+            "limit": "1",
+        },
+    )
+    if not message_rows:
+        raise ValueError("This message could not be verified.")
+
+    filters = {
+        "chat_type": f"eq.{chat_type}",
+        "chat_id": f"eq.{chat_id}",
+        "message_id": f"eq.{message_id}",
+        "user_id": f"eq.{user_id}",
+        "select": "id,emoji",
+        "limit": "1",
+    }
+
+    existing = db_select("nowv_message_reactions", filters)
+
+    if existing and existing[0].get("emoji") == emoji:
+        response = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/nowv_message_reactions",
+            headers=sb_headers(),
+            params={
+                "chat_type": f"eq.{chat_type}",
+                "chat_id": f"eq.{chat_id}",
+                "message_id": f"eq.{message_id}",
+                "user_id": f"eq.{user_id}",
+            },
+            timeout=20,
+        )
+        if response.status_code not in (200, 204):
+            raise sb_error(response, "delete")
+
+    elif existing:
+        db_update(
+            "nowv_message_reactions",
+            {
+                "chat_type": f"eq.{chat_type}",
+                "chat_id": f"eq.{chat_id}",
+                "message_id": f"eq.{message_id}",
+                "user_id": f"eq.{user_id}",
+            },
+            {"emoji": emoji},
+        )
+
+    else:
+        db_insert(
+            "nowv_message_reactions",
+            {
+                "chat_type": chat_type,
+                "chat_id": str(chat_id),
+                "message_id": int(message_id),
+                "user_id": str(user_id),
+                "emoji": emoji,
+            },
+        )
+
+
+def render_reaction_controls(
+    chat_type: str,
+    chat_id: str,
+    message_id,
+    reactions_by_message: dict,
+    current_user_id: str,
+) -> None:
+    rows = reactions_by_message.get(str(message_id), [])
+    counts = {
+        emoji: sum(1 for row in rows if row.get("emoji") == emoji)
+        for emoji in NOWV_REACTION_EMOJIS
+    }
+    selected = next(
+        (
+            row.get("emoji")
+            for row in rows
+            if row.get("user_id") == current_user_id
+        ),
+        None,
+    )
+
+    columns = st.columns(6)
+    for column, emoji in zip(columns, NOWV_REACTION_EMOJIS):
+        label = f"{emoji} {counts[emoji]}" if counts[emoji] else emoji
+        with column:
+            if st.button(
+                label,
+                key=f"reaction_{chat_type}_{chat_id}_{message_id}_{emoji}",
+                type="primary" if selected == emoji else "secondary",
+                help=(
+                    "Remove your reaction"
+                    if selected == emoji
+                    else f"React with {emoji}"
+                ),
+                use_container_width=True,
+            ):
+                try:
+                    toggle_message_reaction(
+                        chat_type,
+                        chat_id,
+                        message_id,
+                        current_user_id,
+                        emoji,
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save reaction: {exc}")
+
+
 # NOWV ACCOUNTS — PASSWORD SECURITY
 # ==========================================
 
@@ -1783,6 +1947,16 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                 if search_term else "No messages yet. Start the conversation."
                             )
 
+                        try:
+                            reactions_by_message = fetch_message_reactions(
+                                "dm", thread_id
+                            )
+                        except Exception as reaction_exc:
+                            reactions_by_message = {}
+                            st.warning(
+                                f"Message reactions are temporarily unavailable: {reaction_exc}"
+                            )
+
                         for dm_message in visible_messages:
                             message_id = dm_message.get("id")
                             is_mine = dm_message.get("sender_nowv_id") == user_id
@@ -1952,6 +2126,13 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                     )
 
                                 if not deleted:
+                                    render_reaction_controls(
+                                        "dm",
+                                        thread_id,
+                                        message_id,
+                                        reactions_by_message,
+                                        user_id,
+                                    )
                                     if st.button(
                                         "Reply",
                                         key=f"dm_reply_{thread_id}_{message_id}",
@@ -2483,6 +2664,14 @@ def render_chat_history():
         st.error(f"Could not load messages: {exc}")
         return
 
+    try:
+        reactions_by_message = fetch_message_reactions("room", room_id)
+    except Exception as reaction_exc:
+        reactions_by_message = {}
+        st.warning(
+            f"Message reactions are temporarily unavailable: {reaction_exc}"
+        )
+    reaction_user_id = f"room:{room_id}:{side}"
     with st.container(height=430):
         if not messages:
             st.info(
@@ -2555,6 +2744,13 @@ def render_chat_history():
                         st.audio(speech_bytes, format="audio/mp3")
                 except Exception as exc:
                     st.warning(f"Translated audio could not be loaded: {exc}")
+            render_reaction_controls(
+                "room",
+                room_id,
+                message.get("id"),
+                reactions_by_message,
+                reaction_user_id,
+            )
 
 
 render_chat_history()
