@@ -838,6 +838,128 @@ def send_dm_voice_message(
     return saved
 
 
+def send_dm_attachment_message(
+    thread_id: str,
+    current_user: dict,
+    filename: str,
+    media_bytes: bytes,
+    source_lang: str,
+    caption: str = "",
+    reply_to_message_id: int | None = None,
+) -> dict:
+    """Send a photo, video or document in an authorized private conversation."""
+    current_id = clean_nowv_id(str(current_user.get("nowv_id") or ""))
+    if not current_id:
+        raise ValueError("Please sign in before sending an attachment.")
+    if source_lang not in LANGUAGES:
+        raise ValueError("Please select a supported language.")
+
+    mime_type, kind, suffix = validate_attachment(filename, media_bytes)
+    caption = str(caption or "").strip()
+    if len(caption) > 2000:
+        raise ValueError("Attachment caption is too long (maximum 2,000 characters).")
+
+    threads = db_select(
+        "nowv_dm_threads",
+        {
+            "thread_id": f"eq.{thread_id}",
+            "select": "thread_id,user_a,user_b",
+            "limit": "1",
+        },
+    )
+    if not threads:
+        raise ValueError("Conversation not found.")
+    thread = threads[0]
+    if current_id not in (thread.get("user_a"), thread.get("user_b")):
+        raise PermissionError("You do not have access to this conversation.")
+
+    receiver_id = thread["user_b"] if current_id == thread["user_a"] else thread["user_a"]
+    receiver_rows = db_select(
+        "nowv_users",
+        {
+            "nowv_id": f"eq.{receiver_id}",
+            "select": "nowv_id,preferred_lang",
+            "limit": "1",
+        },
+    )
+    if not receiver_rows:
+        raise ValueError("The recipient account could not be found.")
+    receiver_lang = receiver_rows[0].get("preferred_lang") or "English"
+
+    reply_id = None
+    if reply_to_message_id is not None:
+        try:
+            reply_id = int(reply_to_message_id)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid reply message.")
+        reply_rows = db_select(
+            "nowv_dm_messages",
+            {
+                "id": f"eq.{reply_id}",
+                "thread_id": f"eq.{thread_id}",
+                "select": "id,deleted_at",
+                "limit": "1",
+            },
+        )
+        if not reply_rows or reply_rows[0].get("deleted_at"):
+            raise ValueError("The message you are replying to is unavailable.")
+
+    # Videos retain the existing NowV speech transcription/translation workflow.
+    if kind == "Video":
+        transcript, translated = translate_media_or_audio(
+            media_bytes, mime_type, source_lang, receiver_lang
+        )
+        body_text = transcript
+        if caption:
+            translated_caption = translate_chat_text(
+                caption, source_lang, receiver_lang
+            )
+            body_text = (body_text + "\\n" + caption).strip()
+            translated = (translated + "\\n" + translated_caption).strip()
+    else:
+        body_text = caption
+        translated = (
+            translate_chat_text(body_text, source_lang, receiver_lang)
+            if body_text else ""
+        )
+
+    # Store the original filename in the first line for a safe download label.
+    original_text = f"📎 {Path(filename).name}"
+    if body_text:
+        original_text += f"\n{body_text}"
+
+    media_path = upload_media(
+        f"dm/{thread_id}", media_bytes, mime_type, suffix
+    )
+    saved = db_insert(
+        "nowv_dm_messages",
+        {
+            "thread_id": thread_id,
+            "sender_nowv_id": current_id,
+            "original_text": original_text,
+            "translated_text": translated,
+            "source_lang": source_lang,
+            "target_lang": receiver_lang,
+            "kind": kind,
+            "media_path": media_path,
+            "media_mime": mime_type,
+            "speech_path": None,
+            "reply_to_message_id": reply_id,
+        },
+    )
+    preview = {"Photo": "📷", "Video": "🎥", "Document": "📎"}[kind]
+    db_update(
+        "nowv_dm_threads",
+        {"thread_id": f"eq.{thread_id}"},
+        {
+            "last_message": (preview + " " + Path(filename).name)[:200],
+            "last_message_sender_id": current_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return saved
+
+
 def mark_dm_thread_read(thread_id: str, current_nowv_id: str) -> None:
     current_id = clean_nowv_id(current_nowv_id)
     safe_thread_id = str(thread_id or "").strip()
@@ -1069,6 +1191,43 @@ def upload_media(room_id: str, media_bytes: bytes, mime_type: str, suffix: str) 
     if response.status_code not in (200, 201):
         raise sb_error(response, "media upload")
     return object_path
+
+
+ATTACHMENT_TYPES = {
+    "jpg": ("image/jpeg", "Photo"),
+    "jpeg": ("image/jpeg", "Photo"),
+    "png": ("image/png", "Photo"),
+    "webp": ("image/webp", "Photo"),
+    "gif": ("image/gif", "Photo"),
+    "mp4": ("video/mp4", "Video"),
+    "mov": ("video/quicktime", "Video"),
+    "webm": ("video/webm", "Video"),
+    "pdf": ("application/pdf", "Document"),
+    "txt": ("text/plain", "Document"),
+    "csv": ("text/csv", "Document"),
+    "doc": ("application/msword", "Document"),
+    "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "Document"),
+    "xls": ("application/vnd.ms-excel", "Document"),
+    "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Document"),
+    "ppt": ("application/vnd.ms-powerpoint", "Document"),
+    "pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation", "Document"),
+}
+
+
+def validate_attachment(filename: str, media_bytes: bytes) -> tuple[str, str, str]:
+    """Validate an allowed photo, video or document using its file extension."""
+    suffix = Path(filename or "").suffix.lower().lstrip(".")
+    if suffix not in ATTACHMENT_TYPES:
+        raise ValueError(
+            "Unsupported file type. Choose a photo, MP4/MOV/WEBM video, "
+            "or PDF/Office/TXT/CSV document."
+        )
+    if not media_bytes:
+        raise ValueError("The selected file is empty.")
+    if len(media_bytes) > MAX_MEDIA_BYTES:
+        raise ValueError("File exceeds the 50 MB NowV upload limit.")
+    mime_type, kind = ATTACHMENT_TYPES[suffix]
+    return mime_type, kind, suffix
 
 
 def download_media(object_path: str | None) -> bytes | None:
@@ -1664,10 +1823,8 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                     original = dm_message.get("original_text") or ""
                                     translated = dm_message.get("translated_text") or ""
 
-                                    is_voice_message = (
-                                        message_kind == "voice"
-                                        or bool(dm_message.get("media_path"))
-                                    )
+                                    is_voice_message = message_kind in ("voice", "voice note")
+                                    is_attachment = message_kind in ("photo", "video", "document")
                                     if is_voice_message:
                                         st.caption("🎙️ Voice message")
                                         media_path = dm_message.get("media_path")
@@ -1714,6 +1871,39 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                                 st.caption(
                                                     "Translated audio is temporarily unavailable."
                                                 )
+                                    elif is_attachment:
+                                        media_path = dm_message.get("media_path")
+                                        media_mime = dm_message.get("media_mime") or ""
+                                        filename = (
+                                            original.splitlines()[0].replace("📎 ", "", 1).strip()
+                                            if original else "NowV attachment"
+                                        )
+                                        caption_text = "\\n".join(original.splitlines()[1:]).strip()
+                                        if media_path:
+                                            try:
+                                                attachment_bytes = download_media(media_path)
+                                                if attachment_bytes:
+                                                    if media_mime.startswith("image/"):
+                                                        st.image(attachment_bytes, caption=filename, use_container_width=True)
+                                                    elif media_mime.startswith("video/"):
+                                                        st.video(attachment_bytes)
+                                                    else:
+                                                        st.download_button(
+                                                            f"📎 Download {filename}",
+                                                            data=attachment_bytes,
+                                                            file_name=filename,
+                                                            mime=media_mime or "application/octet-stream",
+                                                            key=f"dm_attachment_{thread_id}_{message_id}",
+                                                        )
+                                            except Exception as attachment_exc:
+                                                st.warning(f"Attachment unavailable: {attachment_exc}")
+                                        if caption_text:
+                                            st.write(caption_text)
+                                        if translated and translated != caption_text:
+                                            st.caption(
+                                                f"Translation ({dm_message.get('target_lang', 'translated')}):"
+                                            )
+                                            st.write(translated)
                                     else:
                                         st.write(original)
                                         if translated and translated != original:
@@ -1926,6 +2116,58 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                             st.error(
                                                 f"Voice note could not be sent: {voice_exc}"
                                             )
+
+                    with st.expander("📎 Send a photo, video or document"):
+                        st.caption("Attach a file up to 50 MB. Videos are transcribed and translated; captions are translated for photos and documents.")
+                        dm_attachment = st.file_uploader(
+                            "Choose a photo, video or document",
+                            type=[
+                                "jpg", "jpeg", "png", "webp", "gif",
+                                "mp4", "mov", "webm",
+                                "pdf", "doc", "docx", "xls", "xlsx",
+                                "ppt", "pptx", "txt", "csv",
+                            ],
+                            key=f"dm_attachment_upload_{active_thread_id}",
+                        )
+                        dm_attachment_caption = st.text_area(
+                            "Caption (optional)",
+                            max_chars=2000,
+                            key=f"dm_attachment_caption_{active_thread_id}",
+                        )
+                        if dm_attachment is not None:
+                            dm_attachment_bytes = dm_attachment.getvalue()
+                            st.caption(f"Selected: {dm_attachment.name} · {len(dm_attachment_bytes) / (1024 * 1024):.1f} MB")
+                            if st.button(
+                                "Send attachment",
+                                key=f"dm_attachment_send_{active_thread_id}",
+                                type="primary",
+                            ):
+                                dm_attachment_hash = hashlib.sha256(dm_attachment_bytes).hexdigest()
+                                dm_sent_key = f"dm_attachment_sent_{active_thread_id}"
+                                if st.session_state.get(dm_sent_key) == dm_attachment_hash:
+                                    st.info("This file has already been sent.")
+                                else:
+                                    try:
+                                        with st.spinner("Uploading and preparing your attachment..."):
+                                            attachment_source_lang = st.session_state.get(
+                                                f"dm_language_{active_thread_id}",
+                                                current_user.get("preferred_lang", "English"),
+                                            )
+                                            send_dm_attachment_message(
+                                                active_thread_id,
+                                                current_user,
+                                                dm_attachment.name,
+                                                dm_attachment_bytes,
+                                                attachment_source_lang,
+                                                dm_attachment_caption,
+                                                reply_state.get("message_id") if reply_state else None,
+                                            )
+                                        st.session_state[dm_sent_key] = dm_attachment_hash
+                                        st.session_state.pop("nowv_dm_reply", None)
+                                        st.success("Attachment sent.")
+                                        st.rerun()
+                                    except Exception as attachment_exc:
+                                        st.error(f"Attachment could not be sent: {attachment_exc}")
 
 
             else:
@@ -2291,6 +2533,18 @@ def render_chat_history():
                             st.video(media_bytes)
                         elif mime.startswith("audio/"):
                             st.audio(media_bytes, format=mime)
+                        elif mime.startswith("image/"):
+                            st.image(media_bytes, use_container_width=True)
+                        else:
+                            stored_label = str(message.get("original_text") or "NowV attachment")
+                            stored_name = stored_label.splitlines()[0].replace("📎 ", "", 1).strip()
+                            st.download_button(
+                                f"📎 Download {stored_name}",
+                                data=media_bytes,
+                                file_name=stored_name or "nowv-attachment",
+                                mime=mime or "application/octet-stream",
+                                key=f"room_attachment_{message.get('id', message.get('created_at', 'item'))}",
+                            )
                 except Exception as exc:
                     st.warning(f"Media could not be loaded: {exc}")
 
@@ -2312,10 +2566,11 @@ render_chat_history()
 
 st.markdown("### ✉️ Send a Message")
 
-tab_text, tab_audio, tab_video = st.tabs([
+tab_text, tab_audio, tab_video, tab_files = st.tabs([
     "⌨️ Text Message",
     "🎙️ Voice Note",
     "🎥 Video Message",
+    "📎 Photos & Documents",
 ])
 
 
@@ -2463,6 +2718,55 @@ with tab_video:
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Video could not be sent: {exc}")
+
+
+with tab_files:
+    st.caption(
+        f"Send photos or documents to your partner. Optional captions are translated "
+        f"from {my_lang} into {their_lang}."
+    )
+    room_file = st.file_uploader(
+        "Choose a photo or document",
+        type=[
+            "jpg", "jpeg", "png", "webp", "gif",
+            "pdf", "doc", "docx", "xls", "xlsx",
+            "ppt", "pptx", "txt", "csv",
+        ],
+        key=f"nowv_room_file_{room_id}",
+    )
+    room_file_caption = st.text_area(
+        "Caption (optional)",
+        max_chars=2000,
+        key=f"nowv_room_file_caption_{room_id}",
+    )
+    if room_file is not None:
+        room_file_bytes = room_file.getvalue()
+        st.caption(f"Selected: {room_file.name} · {len(room_file_bytes) / (1024 * 1024):.1f} MB")
+        if st.button("📎 Send Photo / Document", type="primary", use_container_width=True):
+            try:
+                file_mime, file_kind, file_suffix = validate_attachment(
+                    room_file.name, room_file_bytes
+                )
+                caption_text = room_file_caption.strip()
+                translated_caption = (
+                    translate_chat_text(caption_text, my_lang, their_lang)
+                    if caption_text else ""
+                )
+                stored_text = f"📎 {Path(room_file.name).name}"
+                if caption_text:
+                    stored_text += f"\\n{caption_text}"
+                save_outgoing_message(
+                    stored_text,
+                    translated_caption,
+                    file_kind,
+                    media_bytes=room_file_bytes,
+                    media_mime=file_mime,
+                    media_suffix=file_suffix,
+                )
+                st.success("Attachment sent.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Attachment could not be sent: {exc}")
 
 
 # ==========================================
