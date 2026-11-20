@@ -1872,9 +1872,18 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                             "Record in your selected language. NowV will transcribe "
                             "and translate it for the recipient."
                         )
+                        voice_input_version_key = (
+                            f"dm_voice_input_version_{active_thread_id}"
+                        )
+                        if voice_input_version_key not in st.session_state:
+                            st.session_state[voice_input_version_key] = 0
+
                         audio_file = st.audio_input(
                             "Record a voice note",
-                            key=f"dm_voice_input_{active_thread_id}",
+                            key=(
+                                f"dm_voice_input_{active_thread_id}_"
+                                f"{st.session_state[voice_input_version_key]}"
+                            ),
                         )
 
                         if audio_file is not None:
@@ -1909,6 +1918,7 @@ if not query_room or st.session_state.get("nowv_app_mode") == "Direct Messages":
                                                 if reply_state else None,
                                             )
                                             st.session_state[sent_hash_key] = audio_hash
+                                            st.session_state[voice_input_version_key] += 1
                                             st.session_state.pop("nowv_dm_reply", None)
                                             st.success("Voice note sent.")
                                             st.rerun()
